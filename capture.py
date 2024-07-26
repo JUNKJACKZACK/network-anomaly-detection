@@ -1,29 +1,95 @@
-import argparse
 import csv
+import time
 import pyshark
+import mysql.connector as mysql
 from scapy.layers.l2 import Ether
 from scapy.layers.inet import IP, UDP, TCP
 from scapy.layers.http import HTTPRequest
-import os
+
+DB_CONFIG = {
+    'user': 'user2',
+    'password': 'password2',
+    'host': 'localhost',
+    'port': 3306,
+    'auth_plugin': 'mysql_native_password'
+}
+
+pending_packet_inserts = []
+
+
+def connect_to_db():
+    connection = mysql.connect(**DB_CONFIG)
+    cursor = connection.cursor()
+    return cursor, connection
+
+
+def close_db_connection(cursor, connection):
+    if cursor:
+        cursor.close()
+    if connection:
+        connection.close()
+
+
+def packets_to_db(db_name):
+
+    while True:
+        cursor, connection = connect_to_db()
+
+        packet_count = len(pending_packet_inserts)
+
+        if packet_count == 0:
+            print("No packets to insert")
+            time.sleep(2)
+            return
+
+        packet_batch = pending_packet_inserts[:packet_count]
+
+        try:
+            if connection.is_connected():
+                cursor = connection.cursor()
+                cursor.execute(f"USE {db_name}")
+
+                insert_query = """
+                INSERT INTO captured_packets (timestamp, highest_layer, l4_protocol, info, source_ip, source_port, 
+                                            destination_ip, destination_port, packet_length, payload, http_host, http_path)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """
+
+                for packet in packet_batch:
+                    # Convert all packet fields to strings or appropriate types
+                    packet = tuple(str(field) if not isinstance(field, (int, float)) else field for field in packet)
+                    cursor.execute(insert_query, packet)
+
+                connection.commit()
+                print("Packet information inserted successfully")
+
+        except mysql.Error as e:
+            print(f"2 Error while connecting to MySQL: {e}")
+        
+        finally:
+            del pending_packet_inserts[:packet_count]
+
+            if connection.is_connected():
+                cursor.close()
+                connection.close()
+                print("MySQL connection is closed")
+
 
 def extract_http_info(pkt_sc):
     """Extract HTTP host and requested URL from the packet."""
     if pkt_sc.haslayer(HTTPRequest):
         http_layer = pkt_sc[HTTPRequest]
-        host = http_layer.Host.decode() if http_layer.Host else 'N/A'
-        path = http_layer.Path.decode() if http_layer.Path else 'N/A'
+        host = http_layer.Host.decode() if http_layer.Host else None
+        path = http_layer.Path.decode() if http_layer.Path else None
         return host, path
-    return 'N/A', 'N/A'
+    return None, None
 
-def print_packet_info(pkt_sh, writer):
-    """Write detailed packet information to the CSV writer.
-    pkt_sh is the PyShark representation of the packet.
-    writer is the CSV writer object.
-    """
+
+def dissect_packet(pkt_sh, writer):
     try:
         # Initialize host and path
-        host, path = 'N/A', 'N/A'
-        
+        host, path = None, None
+
         # Extract raw packet data
         pkt_sc = bytes.fromhex(pkt_sh.frame_raw.value)
         ether_pkt_sc = Ether(pkt_sc)
@@ -48,24 +114,24 @@ def print_packet_info(pkt_sh, writer):
                     host, path = extract_http_info(tcp_pkt_sc)
             else:
                 l4_proto_name = 'Other'
-                l4_sport = l4_dport = 'N/A'
+                l4_sport = l4_dport = None
                 l4_payload_bytes = b''
         else:
             l4_proto_name = 'Non-IP'
-            l4_sport = l4_dport = 'N/A'
+            l4_sport = l4_dport = None
             l4_payload_bytes = b''
-        
+
         # Safely extract attributes and handle missing ones
-        number = getattr(pkt_sh, 'number', 'N/A')
-        sniff_time = getattr(pkt_sh, 'sniff_time', 'N/A')
-        highest_layer = getattr(pkt_sh, 'highest_layer', 'N/A')
-        info = getattr(pkt_sh, 'info', 'N/A')
-        src_ip = getattr(pkt_sh.ip, 'src', 'N/A') if hasattr(pkt_sh, 'ip') else 'N/A'
-        dst_ip = getattr(pkt_sh.ip, 'dst', 'N/A') if hasattr(pkt_sh, 'ip') else 'N/A'
-        length = getattr(pkt_sh, 'length', 'N/A')
+        # number = getattr(pkt_sh, 'number', None)
+        sniff_time = getattr(pkt_sh, 'sniff_time', None)
+        highest_layer = getattr(pkt_sh, 'highest_layer', None)
+        info = getattr(pkt_sh, 'info', None)
+        src_ip = getattr(pkt_sh.ip, 'src', None) if hasattr(pkt_sh, 'ip') else None
+        dst_ip = getattr(pkt_sh.ip, 'dst', None) if hasattr(pkt_sh, 'ip') else None
+        length = getattr(pkt_sh, 'length', None)
 
         # Write packet info to CSV
-        writer.writerow([number, sniff_time, highest_layer, l4_proto_name, info, src_ip, l4_sport, dst_ip, l4_dport, length, l4_payload_bytes.hex(), host, path])
+        pending_packet_inserts.append((sniff_time, highest_layer, l4_proto_name, info, src_ip, l4_sport, dst_ip, l4_dport, length, l4_payload_bytes.hex(), host, path))
         
         return True
     except AttributeError as e:
@@ -75,45 +141,22 @@ def print_packet_info(pkt_sh, writer):
         print(f'Unexpected error parsing packet: {e}')
         return False
 
+
 def live_capture(interface, packet_count, csv_filename):
     """Capture live packets from the specified network interface, write details to CSV."""
-
     capture = pyshark.LiveCapture(interface=interface, use_json=True, include_raw=True)
-    frame_num = 0
 
     try:
-        # Open CSV file for writing
-        with open(csv_filename, 'w', newline='') as csvfile:
-            writer = csv.writer(csvfile)
-            # Write header row
-            writer.writerow(['Number', 'Sniff Time', 'Highest Layer', 'Layer 4 Protocol', 'Info', 'Source IP', 'Source Port', 'Destination IP', 'Destination Port', 'Length', 'Payload', 'Host', 'Path'])
+        writer = None
+        # # Open CSV file for writing
+        # with open(csv_filename, 'w', newline='') as csvfile:
+        #     writer = csv.writer(csvfile)
+        #     # Write header row
+        #     writer.writerow(['Number', 'Sniff Time', 'Highest Layer', 'Layer 4 Protocol', 'Info', 'Source IP', 'Source Port', 'Destination IP', 'Destination Port', 'Length', 'Payload', 'Host', 'Path'])
 
-            for pkt in capture.sniff_continuously(packet_count=packet_count):
-                frame_num += 1
-                print_packet_info(pkt, writer)
-        
-        print('{} packets captured and saved to {}'.format(frame_num, os.path.abspath(csv_filename)))
+        for packet in capture.sniff_continuously(packet_count=packet_count):
+            print(f'Packet: {packet.number}')
+            dissect_packet(packet, writer)
 
     except Exception as e:
         print(f'Error while writing to CSV file: {e}')
-
-def command_line_args():
-    """Helper called from main() to parse the command line arguments"""
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--interface', metavar='<network interface>',
-                        help='network interface to capture packets from', required=True)
-    parser.add_argument('--count', metavar='<packet count>', type=int, default=10,
-                        help='number of packets to capture')
-    parser.add_argument('--output', metavar='<output file>', default='packets.csv',
-                        help='CSV file to save packet details')
-    args = parser.parse_args()
-    return args
-
-def main():
-    """Program main entry"""
-    args = command_line_args()
-    live_capture(args.interface, args.count, args.output)
-
-if __name__ == '__main__':
-    main()
